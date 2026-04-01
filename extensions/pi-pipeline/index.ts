@@ -117,6 +117,63 @@ async function registerOrchestrator(api: ExtensionAPI) {
     content: { role: "orchestrator", sessionDir },
   });
 
+  // ── /pipeline command ─────────────────────────────────────────────────────
+  // Entry point for all pipeline tasks. Writes the user's task to
+  // orchestrator/input/task.json then sends a message to the model telling
+  // it to load the orchestrator skill and begin.
+  //
+  // Usage: /pipeline <task description>
+
+  api.registerCommand("pipeline", {
+    description: "Start a pipeline task routed through the orchestrator",
+    handler: async (args: string) => {
+      const task = args.trim();
+
+      if (!task) {
+        api.sendUserMessage("Usage: /pipeline <task description>");
+        return;
+      }
+
+      // Write the task to orchestrator/input/task.json
+      const taskPayload = {
+        session_id: sessionId,
+        agent: "orchestrator",
+        goal: task,
+        task: "Decompose this goal into a pipeline. Plan the agents needed, write tasks for each, dispatch them in order, and terminate when the reviewer approves.",
+        context_refs: [],
+      };
+
+      writeFileSync(
+        taskPath(sessionDir, "orchestrator", 1),
+        JSON.stringify(taskPayload, null, 2),
+        "utf-8",
+      );
+
+      appendLog(sessionDir, {
+        ts: new Date().toISOString(),
+        session: sessionId,
+        agent: "system",
+        event: "pipeline_start",
+        content: { goal: task, taskPath: taskPath(sessionDir, "orchestrator", 1) },
+      });
+
+      api.setSessionName(`pipeline: ${task.slice(0, 50)}`);
+
+      // Trigger the orchestrator
+      api.sendUserMessage(
+        [
+          `A pipeline task has been queued at: ${taskPath(sessionDir, "orchestrator", 1)}`,
+          "",
+          "Load the orchestrator skill now and follow it exactly:",
+          "1. Call read_input() to read your task",
+          "2. Call log_reasoning to record your plan",
+          "3. For each step: call write_task, then dispatch_agent, then read_agent_output",
+          "4. After review: evaluate and either loop or call terminate_pipeline",
+        ].join("\n"),
+      );
+    },
+  });
+
   // Inject session context into system prompt
   api.on(
     "before_agent_start",
