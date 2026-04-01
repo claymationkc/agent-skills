@@ -2,48 +2,58 @@
  * Pi Pipeline Extension
  *
  * Implements deterministic multi-agent orchestration on top of pi.
+ * Role is detected via PI_PIPELINE_ROLE environment variable:
+ *   - unset / "orchestrator" → registers orchestrator tools
+ *   - "sub-agent"            → registers sub-agent tools
  *
- * Registered tools (callable by any agent via the model):
- *   - log_reasoning      — append a structured entry to reasoning.jsonl
- *   - read_input         — read this agent's task.json from its input directory
- *   - write_output       — write result.json to this agent's output directory
- *   - dispatch_agent     — spawn a specialist agent as a child pi process
- *   - terminate_pipeline — write final/summary.json and close the session
+ * Sub-agents are spawned as child pi processes with env vars:
+ *   PI_PIPELINE_ROLE=sub-agent
+ *   PI_PIPELINE_SESSION_ID=<id>
+ *   PI_PIPELINE_SESSION_DIR=<path>
+ *   PI_PIPELINE_AGENT=<name>
+ *   PI_PIPELINE_RUN=<n>
  *
- * Session directories live under ~/.pi-pipeline/sessions/<session-id>/
- * See ARCHITECTURE.md for the full directory layout and I/O schemas.
+ * Directory layout (see ARCHITECTURE.md):
+ *   ~/.pi-pipeline/sessions/<session-id>/
+ *     reasoning.jsonl
+ *     orchestrator/input/task.json
+ *     orchestrator/output/plan.json
+ *     <agent>/run-<n>/input/task.json
+ *     <agent>/run-<n>/output/result.json
+ *     final/summary.json
  */
 
-import type { ExtensionAPI, BeforeAgentStartEvent, BeforeAgentStartEventResult } from "@mariozechner/pi-coding-agent";
+import type {
+  ExtensionAPI,
+  BeforeAgentStartEvent,
+  BeforeAgentStartEventResult,
+} from "@mariozechner/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
-import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
+import {
+  appendFileSync,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  writeFileSync,
+} from "fs";
 import { homedir } from "os";
 import { join } from "path";
 import { randomUUID } from "crypto";
 import { spawn } from "child_process";
 
-// ── Constants ────────────────────────────────────────────────────────────────
+// ── Constants ─────────────────────────────────────────────────────────────────
 
 const SESSIONS_BASE = join(homedir(), ".pi-pipeline", "sessions");
 const SKILLS_DIR = join(homedir(), "pi-skills", "skills");
 
-/** Context-passing token limits enforced in task/result JSON (chars ≈ tokens * 4) */
-const LIMITS = {
-  taskJson: 4096 * 4,       // 4,096 token input cap
-  resultJson: 2048 * 4,     // 2,048 token output cap
-  architectResult: 8192 * 4 // 8,192 token exception for architect
+/** Approximate char limits (1 token ≈ 4 chars) */
+const TOKEN_LIMITS = {
+  taskJson: 4096 * 4,         // 4,096 tokens — task inputs
+  resultJson: 2048 * 4,       // 2,048 tokens — sub-agent outputs
+  architectResult: 8192 * 4,  // 8,192 tokens — architect output exception
 } as const;
 
-// ── State ────────────────────────────────────────────────────────────────────
-
-interface PipelineState {
-  sessionId: string;
-  sessionDir: string;
-  /** Tracks run count per agent name for directory naming */
-  runCounts: Map<string, number>;
-}
-
-// ── Helpers ──────────────────────────────────────────────────────────────────
+// ── Helpers ───────────────────────────────────────────────────────────────────
 
 function makeSessionId(): string {
   const date = new Date().toISOString().slice(0, 10).replace(/-/g, "");
@@ -51,246 +61,240 @@ function makeSessionId(): string {
 }
 
 function appendLog(sessionDir: string, entry: object): void {
-  const logPath = join(sessionDir, "reasoning.jsonl");
-  appendFileSync(logPath, JSON.stringify(entry) + "\n", "utf-8");
+  appendFileSync(join(sessionDir, "reasoning.jsonl"), JSON.stringify(entry) + "\n", "utf-8");
 }
 
-function agentInputPath(state: PipelineState, agent: string, run: number): string {
-  if (agent === "orchestrator") {
-    return join(state.sessionDir, "orchestrator", "input", "task.json");
-  }
-  return join(state.sessionDir, agent, `run-${run}`, "input", "task.json");
-}
-
-function agentOutputPath(state: PipelineState, agent: string, run: number): string {
-  if (agent === "orchestrator") {
-    return join(state.sessionDir, "orchestrator", "output", "plan.json");
-  }
-  return join(state.sessionDir, agent, `run-${run}`, "output", "result.json");
-}
-
-function enforceTokenLimit(json: string, limitChars: number, label: string): string {
+function enforceLimit(json: string, limitChars: number, label: string): string {
   if (json.length <= limitChars) return json;
-  const truncated = json.slice(0, limitChars);
-  console.warn(`[pi-pipeline] ${label} exceeded limit (${json.length} > ${limitChars} chars) — truncated`);
-  return truncated + "\n/* TRUNCATED: exceeded context token limit */";
+  console.warn(`[pi-pipeline] ${label} truncated (${json.length} > ${limitChars} chars)`);
+  return json.slice(0, limitChars) + "\n/* TRUNCATED: exceeded context token limit */";
+}
+
+function taskPath(sessionDir: string, agent: string, run: number): string {
+  return agent === "orchestrator"
+    ? join(sessionDir, "orchestrator", "input", "task.json")
+    : join(sessionDir, agent, `run-${run}`, "input", "task.json");
+}
+
+function outputPath(sessionDir: string, agent: string, run: number): string {
+  return agent === "orchestrator"
+    ? join(sessionDir, "orchestrator", "output", "plan.json")
+    : join(sessionDir, agent, `run-${run}`, "output", "result.json");
 }
 
 // ── Extension Factory ─────────────────────────────────────────────────────────
 
 export default async function (api: ExtensionAPI) {
-  let state: PipelineState | null = null;
+  const role = process.env.PI_PIPELINE_ROLE ?? "orchestrator";
+  const isOrchestrator = role !== "sub-agent";
 
-  // ── Session Start ──────────────────────────────────────────────────────────
-  // Create session directory structure and reasoning log on new session.
+  if (isOrchestrator) {
+    await registerOrchestrator(api);
+  } else {
+    await registerSubAgent(api);
+  }
+}
 
-  api.on("session_start", async () => {
-    const sessionId = makeSessionId();
-    const sessionDir = join(SESSIONS_BASE, sessionId);
+// ─────────────────────────────────────────────────────────────────────────────
+// ORCHESTRATOR
+// ─────────────────────────────────────────────────────────────────────────────
 
-    mkdirSync(join(sessionDir, "orchestrator", "input"), { recursive: true });
-    mkdirSync(join(sessionDir, "orchestrator", "output"), { recursive: true });
-    mkdirSync(join(sessionDir, "final"), { recursive: true });
+async function registerOrchestrator(api: ExtensionAPI) {
+  const sessionId = makeSessionId();
+  const sessionDir = join(SESSIONS_BASE, sessionId);
+  const runCounts = new Map<string, number>();
 
-    state = { sessionId, sessionDir, runCounts: new Map() };
+  // Create base session directories
+  mkdirSync(join(sessionDir, "orchestrator", "input"), { recursive: true });
+  mkdirSync(join(sessionDir, "orchestrator", "output"), { recursive: true });
+  mkdirSync(join(sessionDir, "final"), { recursive: true });
 
-    appendLog(sessionDir, {
-      ts: new Date().toISOString(),
-      session: sessionId,
-      agent: "system",
-      event: "session_start",
-      content: { sessionsBase: SESSIONS_BASE },
-    });
-
-    api.appendEntry("pi-pipeline-session", {
-      sessionId,
-      sessionDir,
-      message: `Pipeline session started → ${sessionDir}`,
-    });
+  appendLog(sessionDir, {
+    ts: new Date().toISOString(),
+    session: sessionId,
+    agent: "system",
+    event: "session_start",
+    content: { role: "orchestrator", sessionDir },
   });
 
-  // ── Before Agent Start ─────────────────────────────────────────────────────
-  // Inject session context into every agent's system prompt so they know
-  // their session ID and where to find their input/output directories.
-
+  // Inject session context into system prompt
   api.on(
     "before_agent_start",
-    async (event: BeforeAgentStartEvent): Promise<BeforeAgentStartEventResult> => {
-      if (!state) return {};
-
-      const injection = [
+    async (event: BeforeAgentStartEvent): Promise<BeforeAgentStartEventResult> => ({
+      systemPrompt: event.systemPrompt + [
         "",
         "## Pipeline Context",
-        `SESSION_ID: ${state.sessionId}`,
-        `SESSION_DIR: ${state.sessionDir}`,
-        `SKILLS_DIR: ${SKILLS_DIR}`,
+        `SESSION_ID: ${sessionId}`,
+        `SESSION_DIR: ${sessionDir}`,
+        `ROLE: orchestrator`,
         "",
-        "Use the pipeline tools (read_input, write_output, log_reasoning, dispatch_agent,",
-        "terminate_pipeline) for all inter-agent communication. Do not use raw file I/O",
-        "for context passing.",
-      ].join("\n");
-
-      return {
-        systemPrompt: event.systemPrompt + injection,
-      };
-    },
+        "You have access to: log_reasoning, write_task, read_agent_output,",
+        "dispatch_agent, terminate_pipeline.",
+        "Never use raw file I/O for inter-agent communication.",
+      ].join("\n"),
+    }),
   );
 
-  // ── Tool: log_reasoning ────────────────────────────────────────────────────
+  // ── log_reasoning ──────────────────────────────────────────────────────────
 
   api.registerTool({
     name: "log_reasoning",
     label: "Log Reasoning",
-    description: "Append a structured reasoning entry to the session JSONL log.",
-    promptSnippet: "log_reasoning(agent, event, content) → appends to reasoning.jsonl",
+    description: "Append a reasoning entry to the session JSONL log.",
+    promptSnippet: "log_reasoning(event, content) — append to reasoning.jsonl",
     parameters: Type.Object({
-      agent: Type.String({ description: "Agent name (e.g. orchestrator, coding, reviewer)" }),
-      event: Type.String({ description: "Event type (e.g. plan, dispatch, eval, complete, terminate)" }),
-      content: Type.Unknown({ description: "Arbitrary JSON content to log" }),
+      event: Type.String({ description: "Event type: plan | dispatch | eval | terminate" }),
+      content: Type.Unknown({ description: "JSON content to log" }),
     }),
     execute: async (_id, params) => {
-      if (!state) return { llmContent: "Error: no active pipeline session" };
-
-      const entry = {
+      appendLog(sessionDir, {
         ts: new Date().toISOString(),
-        session: state.sessionId,
-        agent: params.agent,
+        session: sessionId,
+        agent: "orchestrator",
         event: params.event,
         content: params.content,
+      });
+      return { llmContent: `Logged orchestrator/${params.event}` };
+    },
+  });
+
+  // ── write_task ─────────────────────────────────────────────────────────────
+
+  api.registerTool({
+    name: "write_task",
+    label: "Write Task",
+    description: "Write a task.json to a sub-agent's input directory. Auto-increments run count.",
+    promptSnippet: "write_task(agent, task) — write task.json, returns run number",
+    parameters: Type.Object({
+      agent: Type.String({ description: "Sub-agent name (e.g. coding, reviewer, testing)" }),
+      task: Type.Unknown({ description: "Task object conforming to input schema (4,096 token limit)" }),
+    }),
+    execute: async (_id, params) => {
+      const run = (runCounts.get(params.agent) ?? 0) + 1;
+      runCounts.set(params.agent, run);
+
+      const inputDir = join(sessionDir, params.agent, `run-${run}`, "input");
+      mkdirSync(inputDir, { recursive: true });
+      mkdirSync(join(sessionDir, params.agent, `run-${run}`, "output"), { recursive: true });
+
+      const taskWithMeta = {
+        session_id: sessionId,
+        agent: params.agent,
+        run,
+        ...(params.task as object),
       };
 
-      appendLog(state.sessionDir, entry);
-      return { llmContent: `Logged: ${params.agent}/${params.event}` };
+      const raw = JSON.stringify(taskWithMeta, null, 2);
+      const bounded = enforceLimit(raw, TOKEN_LIMITS.taskJson, `${params.agent}/task`);
+      const path = taskPath(sessionDir, params.agent, run);
+
+      writeFileSync(path, bounded, "utf-8");
+
+      appendLog(sessionDir, {
+        ts: new Date().toISOString(),
+        session: sessionId,
+        agent: "orchestrator",
+        event: "write_task",
+        content: { to: params.agent, run, path },
+      });
+
+      return { llmContent: `Task written → ${path} (run-${run})` };
     },
   });
 
-  // ── Tool: read_input ───────────────────────────────────────────────────────
+  // ── read_agent_output ──────────────────────────────────────────────────────
 
   api.registerTool({
-    name: "read_input",
-    label: "Read Input",
-    description: "Read this agent's task.json from its input directory.",
-    promptSnippet: "read_input(agent, run?) → returns task JSON",
+    name: "read_agent_output",
+    label: "Read Agent Output",
+    description: "Read the result.json from a sub-agent's latest completed run.",
+    promptSnippet: "read_agent_output(agent, run?) — returns result JSON",
     parameters: Type.Object({
-      agent: Type.String({ description: "Agent name" }),
-      run: Type.Optional(Type.Number({ description: "Run number (default: 1)" })),
+      agent: Type.String({ description: "Sub-agent name" }),
+      run: Type.Optional(Type.Number({ description: "Run number (default: latest)" })),
     }),
     execute: async (_id, params) => {
-      if (!state) return { llmContent: "Error: no active pipeline session" };
+      const run = params.run ?? (runCounts.get(params.agent) ?? 1);
+      const path = outputPath(sessionDir, params.agent, run);
 
-      const run = params.run ?? 1;
-      const inputPath = agentInputPath(state, params.agent, run);
-
-      if (!existsSync(inputPath)) {
-        return { llmContent: `Error: input not found at ${inputPath}` };
+      if (!existsSync(path)) {
+        return { llmContent: `Error: output not found at ${path}` };
       }
 
-      const content = readFileSync(inputPath, "utf-8");
-      return { llmContent: content };
+      return { llmContent: readFileSync(path, "utf-8") };
     },
   });
 
-  // ── Tool: write_output ─────────────────────────────────────────────────────
-
-  api.registerTool({
-    name: "write_output",
-    label: "Write Output",
-    description: "Write this agent's result.json to its output directory. Enforces token limits.",
-    promptSnippet: "write_output(agent, run, result) → writes result.json",
-    parameters: Type.Object({
-      agent: Type.String({ description: "Agent name" }),
-      run: Type.Optional(Type.Number({ description: "Run number (default: 1)" })),
-      result: Type.Unknown({ description: "Result object to write (must conform to output schema)" }),
-    }),
-    execute: async (_id, params) => {
-      if (!state) return { llmContent: "Error: no active pipeline session" };
-
-      const run = params.run ?? 1;
-      const outputPath = agentOutputPath(state, params.agent, run);
-      const outputDir = join(outputPath, "..");
-
-      mkdirSync(outputDir, { recursive: true });
-
-      const limitChars = params.agent === "senior-architect"
-        ? LIMITS.architectResult
-        : LIMITS.resultJson;
-
-      const raw = JSON.stringify(params.result, null, 2);
-      const bounded = enforceTokenLimit(raw, limitChars, `${params.agent}/output`);
-
-      writeFileSync(outputPath, bounded, "utf-8");
-      return { llmContent: `Written to ${outputPath} (${bounded.length} chars)` };
-    },
-  });
-
-  // ── Tool: dispatch_agent ───────────────────────────────────────────────────
-  // Spawns a specialist agent as a child pi process in print mode.
-  // The child process runs the named skill with its pipeline context injected.
+  // ── dispatch_agent ─────────────────────────────────────────────────────────
 
   api.registerTool({
     name: "dispatch_agent",
     label: "Dispatch Agent",
-    description: "Spawn a specialist agent as a child pi process to process its input task.",
-    promptSnippet: "dispatch_agent(agent, skill) → runs specialist, returns exit status",
+    description: "Spawn a sub-agent as a child pi process. Call write_task first.",
+    promptSnippet: "dispatch_agent(agent, skill?) — runs specialist, returns exit status",
     parameters: Type.Object({
-      agent: Type.String({ description: "Agent name (matches directory and skill name)" }),
+      agent: Type.String({ description: "Sub-agent name" }),
       skill: Type.Optional(Type.String({ description: "Skill name if different from agent name" })),
     }),
     execute: async (_id, params, signal) => {
-      if (!state) return { llmContent: "Error: no active pipeline session" };
-
+      const run = runCounts.get(params.agent) ?? 1;
       const skillName = params.skill ?? params.agent;
       const skillPath = join(SKILLS_DIR, skillName);
-      const runCount = (state.runCounts.get(params.agent) ?? 0) + 1;
-      state.runCounts.set(params.agent, runCount);
 
-      // Create input/output directories for this run
-      mkdirSync(join(state.sessionDir, params.agent, `run-${runCount}`, "input"), { recursive: true });
-      mkdirSync(join(state.sessionDir, params.agent, `run-${runCount}`, "output"), { recursive: true });
+      if (!existsSync(taskPath(sessionDir, params.agent, run))) {
+        return { llmContent: `Error: no task written for ${params.agent} run-${run}. Call write_task first.` };
+      }
 
-      appendLog(state.sessionDir, {
+      appendLog(sessionDir, {
         ts: new Date().toISOString(),
-        session: state.sessionId,
+        session: sessionId,
         agent: "orchestrator",
         event: "dispatch",
-        content: { to: params.agent, skill: skillName, run: runCount },
+        content: { to: params.agent, skill: skillName, run },
       });
 
       const prompt = [
-        `You are the ${params.agent} agent.`,
-        `Session: ${state.sessionId}`,
-        `Run: ${runCount}`,
-        `Call read_input("${params.agent}", ${runCount}) to get your task.`,
-        `Call log_reasoning at the start and end of your work.`,
-        `Call write_output("${params.agent}", ${runCount}, result) when done.`,
+        `You are the ${params.agent} agent. Run ${run}.`,
+        `Start by calling read_input() to get your task.`,
+        `Call log_reasoning at start and end.`,
+        `Call write_output(result) when done.`,
       ].join(" ");
 
+      const env: NodeJS.ProcessEnv = {
+        ...process.env,
+        PI_PIPELINE_ROLE: "sub-agent",
+        PI_PIPELINE_SESSION_ID: sessionId,
+        PI_PIPELINE_SESSION_DIR: sessionDir,
+        PI_PIPELINE_AGENT: params.agent,
+        PI_PIPELINE_RUN: String(run),
+      };
+
       return new Promise((resolve) => {
-        const args = ["--print", "--skill", skillPath, prompt];
-        const proc = spawn("pi", args, { stdio: ["ignore", "pipe", "pipe"] });
+        const proc = spawn("pi", ["--print", "--skill", skillPath, prompt], {
+          env,
+          stdio: ["ignore", "pipe", "pipe"],
+        });
 
         let stdout = "";
         let stderr = "";
-
-        proc.stdout?.on("data", (chunk: Buffer) => { stdout += chunk.toString(); });
-        proc.stderr?.on("data", (chunk: Buffer) => { stderr += chunk.toString(); });
-
+        proc.stdout?.on("data", (c: Buffer) => { stdout += c.toString(); });
+        proc.stderr?.on("data", (c: Buffer) => { stderr += c.toString(); });
         signal?.addEventListener("abort", () => proc.kill("SIGTERM"));
 
         proc.on("close", (code) => {
-          appendLog(state!.sessionDir, {
+          appendLog(sessionDir, {
             ts: new Date().toISOString(),
-            session: state!.sessionId,
+            session: sessionId,
             agent: params.agent,
-            event: "complete",
-            run: runCount,
+            event: "process_exit",
+            run,
             content: { exit_code: code },
           });
 
-          const tail = (s: string) => s.slice(-800).trim();
+          const tail = (s: string) => s.slice(-600).trim();
           resolve({
             llmContent: [
-              `Agent ${params.agent} (run-${runCount}) exited with code ${code}.`,
+              `${params.agent} (run-${run}) exited ${code}.`,
               stdout ? `stdout: ${tail(stdout)}` : "",
               stderr ? `stderr: ${tail(stderr)}` : "",
             ].filter(Boolean).join("\n"),
@@ -304,21 +308,21 @@ export default async function (api: ExtensionAPI) {
     },
   });
 
-  // ── Tool: terminate_pipeline ──────────────────────────────────────────────
+  // ── terminate_pipeline ─────────────────────────────────────────────────────
 
   api.registerTool({
     name: "terminate_pipeline",
     label: "Terminate Pipeline",
-    description: "Mark the pipeline as complete or max-iterations-reached and write final/summary.json.",
-    promptSnippet: "terminate_pipeline(status, summary) → writes final summary",
+    description: "Write final/summary.json and close the pipeline. Always call this at the end.",
+    promptSnippet: "terminate_pipeline(status, summary) — writes final summary",
     parameters: Type.Object({
       status: Type.Union([
         Type.Literal("complete"),
         Type.Literal("max-iterations-reached"),
-      ], { description: "Outcome status" }),
+      ]),
       summary: Type.Object({
         goal: Type.String(),
-        deliverables: Type.Array(Type.String(), { description: "Artifact paths produced" }),
+        deliverables: Type.Array(Type.String()),
         test_results: Type.Optional(Type.Object({
           passed: Type.Number(),
           failed: Type.Number(),
@@ -326,44 +330,161 @@ export default async function (api: ExtensionAPI) {
         })),
         outstanding_issues: Type.Optional(
           Type.Array(Type.String(), {
-            description: "Issues not resolved — required when status is max-iterations-reached",
-          })
+            description: "Unresolved issues — required when status is max-iterations-reached",
+          }),
         ),
         notes: Type.Optional(Type.String()),
       }),
     }),
     execute: async (_id, params) => {
-      if (!state) return { llmContent: "Error: no active pipeline session" };
+      const finalPath = join(sessionDir, "final", "summary.json");
 
-      const finalPath = join(state.sessionDir, "final", "summary.json");
       const summary = {
-        session_id: state.sessionId,
+        session_id: sessionId,
         status: params.status,
         terminated_at: new Date().toISOString(),
-        iterations: Math.max(...Array.from(state.runCounts.values()), 0),
-        agent_runs: Object.fromEntries(state.runCounts),
+        agent_runs: Object.fromEntries(runCounts),
         ...params.summary,
       };
 
       writeFileSync(finalPath, JSON.stringify(summary, null, 2), "utf-8");
 
-      appendLog(state.sessionDir, {
+      appendLog(sessionDir, {
         ts: new Date().toISOString(),
-        session: state.sessionId,
+        session: sessionId,
         agent: "orchestrator",
         event: "terminate",
-        content: { status: params.status, summary_path: finalPath },
+        content: { status: params.status, finalPath },
       });
 
-      return {
-        llmContent: [
-          `Pipeline terminated: ${params.status}`,
-          `Summary written to: ${finalPath}`,
-          params.status === "max-iterations-reached" && params.summary.outstanding_issues?.length
-            ? `\nOutstanding issues:\n${params.summary.outstanding_issues.map((i) => `  - ${i}`).join("\n")}`
-            : "",
-        ].filter(Boolean).join("\n"),
-      };
+      const lines = [
+        `Pipeline ${params.status} → ${finalPath}`,
+      ];
+
+      if (params.status === "max-iterations-reached" && params.summary.outstanding_issues?.length) {
+        lines.push("\nOutstanding issues (needs human resolution):");
+        for (const issue of params.summary.outstanding_issues) {
+          lines.push(`  - ${issue}`);
+        }
+        lines.push("\nDeliverables completed so far:");
+        for (const d of params.summary.deliverables) {
+          lines.push(`  - ${d}`);
+        }
+      }
+
+      return { llmContent: lines.join("\n") };
+    },
+  });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SUB-AGENT
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function registerSubAgent(api: ExtensionAPI) {
+  const sessionId = process.env.PI_PIPELINE_SESSION_ID!;
+  const sessionDir = process.env.PI_PIPELINE_SESSION_DIR!;
+  const agentName = process.env.PI_PIPELINE_AGENT!;
+  const run = Number(process.env.PI_PIPELINE_RUN ?? "1");
+
+  // Inject agent identity into system prompt
+  api.on(
+    "before_agent_start",
+    async (event: BeforeAgentStartEvent): Promise<BeforeAgentStartEventResult> => ({
+      systemPrompt: event.systemPrompt + [
+        "",
+        "## Pipeline Context",
+        `SESSION_ID: ${sessionId}`,
+        `SESSION_DIR: ${sessionDir}`,
+        `ROLE: sub-agent`,
+        `AGENT: ${agentName}`,
+        `RUN: ${run}`,
+        "",
+        "You have access to: read_input, write_output, log_reasoning.",
+        "Never read or write other agents' directories.",
+        "Never use raw file I/O for context passing.",
+      ].join("\n"),
+    }),
+  );
+
+  // ── log_reasoning ──────────────────────────────────────────────────────────
+
+  api.registerTool({
+    name: "log_reasoning",
+    label: "Log Reasoning",
+    description: "Append a reasoning entry to the session JSONL log.",
+    promptSnippet: "log_reasoning(event, content) — append to reasoning.jsonl",
+    parameters: Type.Object({
+      event: Type.String({ description: "Event type: start | complete | error" }),
+      content: Type.Unknown({ description: "JSON content to log" }),
+    }),
+    execute: async (_id, params) => {
+      appendLog(sessionDir, {
+        ts: new Date().toISOString(),
+        session: sessionId,
+        agent: agentName,
+        run,
+        event: params.event,
+        content: params.content,
+      });
+      return { llmContent: `Logged ${agentName}/${params.event}` };
+    },
+  });
+
+  // ── read_input ─────────────────────────────────────────────────────────────
+
+  api.registerTool({
+    name: "read_input",
+    label: "Read Input",
+    description: "Read this agent's task.json from its input directory.",
+    promptSnippet: "read_input() — returns task JSON",
+    parameters: Type.Object({}),
+    execute: async () => {
+      const path = taskPath(sessionDir, agentName, run);
+
+      if (!existsSync(path)) {
+        return { llmContent: `Error: task not found at ${path}` };
+      }
+
+      return { llmContent: readFileSync(path, "utf-8") };
+    },
+  });
+
+  // ── write_output ───────────────────────────────────────────────────────────
+
+  api.registerTool({
+    name: "write_output",
+    label: "Write Output",
+    description: "Write this agent's result to its output directory. Enforces token limits.",
+    promptSnippet: "write_output(result) — writes result.json",
+    parameters: Type.Object({
+      result: Type.Unknown({ description: "Result object conforming to output schema" }),
+    }),
+    execute: async (_id, params) => {
+      const path = outputPath(sessionDir, agentName, run);
+      const limitChars = agentName === "senior-architect"
+        ? TOKEN_LIMITS.architectResult
+        : TOKEN_LIMITS.resultJson;
+
+      const raw = JSON.stringify(
+        { session_id: sessionId, agent: agentName, run, ...(params.result as object) },
+        null,
+        2,
+      );
+      const bounded = enforceLimit(raw, limitChars, `${agentName}/output`);
+
+      writeFileSync(path, bounded, "utf-8");
+
+      appendLog(sessionDir, {
+        ts: new Date().toISOString(),
+        session: sessionId,
+        agent: agentName,
+        run,
+        event: "write_output",
+        content: { path, chars: bounded.length },
+      });
+
+      return { llmContent: `Output written → ${path} (${bounded.length} chars)` };
     },
   });
 }
