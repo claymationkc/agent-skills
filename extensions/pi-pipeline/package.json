@@ -1,0 +1,7 @@
+{
+  "name": "pi-pipeline",
+  "version": "0.1.0",
+  "pi": {
+    "extensions": ["index.ts"]
+  }
+}
