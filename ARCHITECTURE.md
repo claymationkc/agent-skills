@@ -25,8 +25,15 @@ Every agent invocation has two distinct token limits:
 
 | Budget | Default | Purpose |
 |--------|---------|---------|
-| **Context budget** | 2,048 tokens | Input/output JSON passed between agents |
-| **Work budget** | 32,768 tokens | The agent's actual reasoning and output |
+| **Context budget** | 2,048–8,192 tokens | Input/output JSON passed between agents (varies by direction and role) |
+| **Work budget** | 8,192–32,768 tokens | The agent's actual reasoning and output (varies by role) |
+
+**Inputs can be richer than outputs.** The orchestrator composes task inputs carefully and completely.
+Agents are forced to summarize their results — not dump their full working context.
+
+The one exception is the architect: its output *is* the source of truth for all downstream agents.
+Compressing a real system design causes information loss that compounds through every subsequent agent.
+The architect output cap is set higher to preserve fidelity.
 
 The context budget is hard. An agent that tries to pass a 10,000-token output to the next
 agent gets truncated or blocked. This forces agents to summarize and compress — which is
@@ -572,12 +579,24 @@ This pattern is documented for two implementations:
 
 ## Token Limit Reference
 
-| Context | Limit | Rationale |
-|---------|-------|-----------|
-| `input/task.json` | 2,048 tokens | Forces focused task definition |
-| `output/result.json` | 2,048 tokens | Forces summarization, prevents bloat |
-| Orchestrator work budget | 8,192 tokens | Planning only, no heavy lifting |
-| Architect work budget | 16,384 tokens | Design needs room to think |
-| Coding work budget | 32,768 tokens | Needs room for full implementation |
-| Testing work budget | 32,768 tokens | May need to run and report output |
-| Review work budget | 16,384 tokens | Reading + analysis, not generation |
+### Context passing (I/O between agents)
+
+Inputs and outputs have **asymmetric limits** by design. Task inputs need to be complete and
+unambiguous. Result outputs must be compressed summaries — agents cannot pass their full working
+context forward.
+
+| File | Limit | Rationale |
+|------|-------|-----------|
+| `input/task.json` (all agents) | 4,096 tokens | Task definitions must be complete and unambiguous |
+| `output/result.json` (all agents) | 2,048 tokens | Forces summarization — compress, don't dump |
+| `architect/*/output/result.json` | 8,192 tokens | Exception: design artifacts are the source of truth for all downstream agents. Compression causes compounding information loss. |
+
+### Work budgets (per agent role)
+
+| Agent | Work budget | Rationale |
+|-------|-------------|-----------|
+| Orchestrator | 8,192 tokens | Planning only — no implementation |
+| Architect | 16,384 tokens | Design needs room to reason about trade-offs |
+| Coding | 32,768 tokens | Full implementations require space |
+| Testing | 32,768 tokens | Writing tests + capturing run output |
+| Review | 16,384 tokens | Reading and analysis, not generation |
