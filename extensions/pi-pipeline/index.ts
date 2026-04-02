@@ -33,6 +33,7 @@ import {
   appendFileSync,
   existsSync,
   mkdirSync,
+  readdirSync,
   readFileSync,
   writeFileSync,
 } from "fs";
@@ -52,6 +53,80 @@ const TOKEN_LIMITS = {
   resultJson: 2048 * 4,       // 2,048 tokens — sub-agent outputs
   architectResult: 8192 * 4,  // 8,192 tokens — architect output exception
 } as const;
+
+// ── Usage tracking ────────────────────────────────────────────────────────────
+
+interface UsageTotals {
+  agent: string;
+  run: number | "orchestrator";
+  model: string;
+  turns: number;
+  input: number;
+  output: number;
+  cacheRead: number;
+  cacheWrite: number;
+  totalTokens: number;
+  cost: { input: number; output: number; cacheRead: number; cacheWrite: number; total: number };
+}
+
+function makeUsage(agent: string, run: number | "orchestrator"): UsageTotals {
+  return {
+    agent, run, model: "", turns: 0,
+    input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+  };
+}
+
+function accumulateUsage(totals: UsageTotals, event: any): void {
+  const msg = event.message;
+  if (msg?.role !== "assistant" || !msg.usage) return;
+  const u = msg.usage;
+  totals.turns++;
+  totals.model = msg.model ?? totals.model;
+  totals.input += u.input ?? 0;
+  totals.output += u.output ?? 0;
+  totals.cacheRead += u.cacheRead ?? 0;
+  totals.cacheWrite += u.cacheWrite ?? 0;
+  totals.totalTokens += u.totalTokens ?? 0;
+  if (u.cost) {
+    totals.cost.input += u.cost.input ?? 0;
+    totals.cost.output += u.cost.output ?? 0;
+    totals.cost.cacheRead += u.cost.cacheRead ?? 0;
+    totals.cost.cacheWrite += u.cost.cacheWrite ?? 0;
+    totals.cost.total += u.cost.total ?? 0;
+  }
+}
+
+function writeUsageFile(sessionDir: string, filename: string, totals: UsageTotals): void {
+  const dir = join(sessionDir, "usage");
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, filename), JSON.stringify(totals, null, 2), "utf-8");
+}
+
+function aggregateUsage(sessionDir: string): UsageTotals {
+  const dir = join(sessionDir, "usage");
+  const total = makeUsage("total", "orchestrator");
+
+  try {
+    const files = readdirSync(dir).filter((f: string) => f.endsWith(".json") && f !== "total.json");
+    for (const file of files) {
+      const u: UsageTotals = JSON.parse(readFileSync(join(dir, file), "utf-8"));
+      total.turns += u.turns;
+      total.input += u.input;
+      total.output += u.output;
+      total.cacheRead += u.cacheRead;
+      total.cacheWrite += u.cacheWrite;
+      total.totalTokens += u.totalTokens;
+      total.cost.input += u.cost.input;
+      total.cost.output += u.cost.output;
+      total.cost.cacheRead += u.cost.cacheRead;
+      total.cost.cacheWrite += u.cost.cacheWrite;
+      total.cost.total += u.cost.total;
+    }
+  } catch { /* no usage files yet */ }
+
+  return total;
+}
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -103,11 +178,13 @@ async function registerOrchestrator(api: ExtensionAPI) {
   const sessionId = makeSessionId();
   const sessionDir = join(SESSIONS_BASE, sessionId);
   const runCounts = new Map<string, number>();
+  const usage = makeUsage("orchestrator", "orchestrator");
 
   // Create base session directories
   mkdirSync(join(sessionDir, "orchestrator", "input"), { recursive: true });
   mkdirSync(join(sessionDir, "orchestrator", "output"), { recursive: true });
   mkdirSync(join(sessionDir, "final"), { recursive: true });
+  mkdirSync(join(sessionDir, "usage"), { recursive: true });
 
   appendLog(sessionDir, {
     ts: new Date().toISOString(),
@@ -192,6 +269,9 @@ async function registerOrchestrator(api: ExtensionAPI) {
     }),
   );
 
+  // Accumulate token usage from every assistant turn
+  api.on("turn_end", async (event: any) => { accumulateUsage(usage, event); });
+
   // ── log_reasoning ──────────────────────────────────────────────────────────
 
   api.registerTool({
@@ -211,7 +291,7 @@ async function registerOrchestrator(api: ExtensionAPI) {
         event: params.event,
         content: params.content,
       });
-      return { llmContent: `Logged orchestrator/${params.event}` };
+      return { content: [{ type: "text", text: `Logged orchestrator/${params.event}` }] };
     },
   });
 
@@ -255,7 +335,7 @@ async function registerOrchestrator(api: ExtensionAPI) {
         content: { to: params.agent, run, path },
       });
 
-      return { llmContent: `Task written → ${path} (run-${run})` };
+      return { content: [{ type: "text", text: `Task written → ${path} (run-${run})` }] };
     },
   });
 
@@ -275,10 +355,10 @@ async function registerOrchestrator(api: ExtensionAPI) {
       const path = outputPath(sessionDir, params.agent, run);
 
       if (!existsSync(path)) {
-        return { llmContent: `Error: output not found at ${path}` };
+        return { content: [{ type: "text", text: `Error: output not found at ${path}` }] };
       }
 
-      return { llmContent: readFileSync(path, "utf-8") };
+      return { content: [{ type: "text", text: readFileSync(path, "utf-8") }] };
     },
   });
 
@@ -299,7 +379,7 @@ async function registerOrchestrator(api: ExtensionAPI) {
       const skillPath = join(SKILLS_DIR, skillName);
 
       if (!existsSync(taskPath(sessionDir, params.agent, run))) {
-        return { llmContent: `Error: no task written for ${params.agent} run-${run}. Call write_task first.` };
+        return { content: [{ type: "text", text: `Error: no task written for ${params.agent} run-${run}. Call write_task first.` }] };
       }
 
       appendLog(sessionDir, {
@@ -350,16 +430,16 @@ async function registerOrchestrator(api: ExtensionAPI) {
 
           const tail = (s: string) => s.slice(-600).trim();
           resolve({
-            llmContent: [
+            content: [{ type: "text", text: [
               `${params.agent} (run-${run}) exited ${code}.`,
               stdout ? `stdout: ${tail(stdout)}` : "",
               stderr ? `stderr: ${tail(stderr)}` : "",
-            ].filter(Boolean).join("\n"),
+            ].filter(Boolean).join("\n") }],
           });
         });
 
         proc.on("error", (err) => {
-          resolve({ llmContent: `Failed to spawn ${params.agent}: ${err.message}` });
+          resolve({ content: [{ type: "text", text: `Failed to spawn ${params.agent}: ${err.message}` }] });
         });
       });
     },
@@ -370,8 +450,8 @@ async function registerOrchestrator(api: ExtensionAPI) {
   api.registerTool({
     name: "terminate_pipeline",
     label: "Terminate Pipeline",
-    description: "Write final/summary.json and close the pipeline. Always call this at the end.",
-    promptSnippet: "terminate_pipeline(status, summary) — writes final summary",
+    description: "Write final/summary.json and close the pipeline. Always call this at the end. status must be exactly \"complete\" or \"max-iterations-reached\".",
+    promptSnippet: "terminate_pipeline(status, summary) — status: \"complete\" | \"max-iterations-reached\"",
     parameters: Type.Object({
       status: Type.Union([
         Type.Literal("complete"),
@@ -406,14 +486,20 @@ async function registerOrchestrator(api: ExtensionAPI) {
 
       writeFileSync(finalPath, JSON.stringify(summary, null, 2), "utf-8");
 
+      // Write orchestrator usage then aggregate all agents into total.json
+      writeUsageFile(sessionDir, "orchestrator.json", usage);
+      const total = aggregateUsage(sessionDir);
+      writeUsageFile(sessionDir, "total.json", total);
+
       appendLog(sessionDir, {
         ts: new Date().toISOString(),
         session: sessionId,
         agent: "orchestrator",
         event: "terminate",
-        content: { status: params.status, finalPath },
+        content: { status: params.status, finalPath, usage: total },
       });
 
+      const totalPath = join(sessionDir, "usage", "total.json");
       const lines = [
         `Pipeline ${params.status} → ${finalPath}`,
       ];
@@ -429,7 +515,18 @@ async function registerOrchestrator(api: ExtensionAPI) {
         }
       }
 
-      return { llmContent: lines.join("\n") };
+      lines.push(
+        "",
+        `Token usage → ${totalPath}`,
+        `  turns:       ${total.turns}`,
+        `  input:       ${total.input.toLocaleString()}`,
+        `  output:      ${total.output.toLocaleString()}`,
+        `  cache read:  ${total.cacheRead.toLocaleString()}`,
+        `  total:       ${total.totalTokens.toLocaleString()}`,
+        `  cost:        $${total.cost.total.toFixed(4)}`,
+      );
+
+      return { content: [{ type: "text", text: lines.join("\n") }] };
     },
   });
 }
@@ -443,6 +540,10 @@ async function registerSubAgent(api: ExtensionAPI) {
   const sessionDir = process.env.PI_PIPELINE_SESSION_DIR!;
   const agentName = process.env.PI_PIPELINE_AGENT!;
   const run = Number(process.env.PI_PIPELINE_RUN ?? "1");
+  const usage = makeUsage(agentName, run);
+
+  // Accumulate token usage from every assistant turn
+  api.on("turn_end", async (event: any) => { accumulateUsage(usage, event); });
 
   // Inject agent identity into system prompt
   api.on(
@@ -484,7 +585,7 @@ async function registerSubAgent(api: ExtensionAPI) {
         event: params.event,
         content: params.content,
       });
-      return { llmContent: `Logged ${agentName}/${params.event}` };
+      return { content: [{ type: "text", text: `Logged ${agentName}/${params.event}` }] };
     },
   });
 
@@ -500,10 +601,10 @@ async function registerSubAgent(api: ExtensionAPI) {
       const path = taskPath(sessionDir, agentName, run);
 
       if (!existsSync(path)) {
-        return { llmContent: `Error: task not found at ${path}` };
+        return { content: [{ type: "text", text: `Error: task not found at ${path}` }] };
       }
 
-      return { llmContent: readFileSync(path, "utf-8") };
+      return { content: [{ type: "text", text: readFileSync(path, "utf-8") }] };
     },
   });
 
@@ -531,6 +632,7 @@ async function registerSubAgent(api: ExtensionAPI) {
       const bounded = enforceLimit(raw, limitChars, `${agentName}/output`);
 
       writeFileSync(path, bounded, "utf-8");
+      writeUsageFile(sessionDir, `${agentName}-run-${run}.json`, usage);
 
       appendLog(sessionDir, {
         ts: new Date().toISOString(),
@@ -541,7 +643,7 @@ async function registerSubAgent(api: ExtensionAPI) {
         content: { path, chars: bounded.length },
       });
 
-      return { llmContent: `Output written → ${path} (${bounded.length} chars)` };
+      return { content: [{ type: "text", text: `Output written → ${path} (${bounded.length} chars)` }] };
     },
   });
 }
