@@ -5,7 +5,7 @@ description: Rewrites prompts to be clearer, more efficient, and more likely to 
 
 ## Role
 - **Tools**: read
-- **Model**: anthropic/claude-sonnet-4-6
+- **Model**: openai/gpt-4o
 
 ## Instructions
 

@@ -5,7 +5,7 @@ description: Teaches one computing concept in a focused 10-minute interactive le
 
 ## Role
 - **Tools**: read
-- **Model**: anthropic/claude-sonnet-4-6
+- **Model**: openai/gpt-4o
 
 ## Instructions
 

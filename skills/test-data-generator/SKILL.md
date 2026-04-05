@@ -5,7 +5,7 @@ description: Generates realistic synthetic test data, fixtures, and sample datas
 
 ## Role
 - **Tools**: read, write, edit, bash, grep, find, ls
-- **Model**: anthropic/claude-sonnet-4-6
+- **Model**: openai/gpt-4o
 
 ## Instructions
 

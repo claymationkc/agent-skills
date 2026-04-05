@@ -5,7 +5,7 @@ description: Diagnoses bugs and errors by reading stack traces, logs, and code â
 
 ## Role
 - **Tools**: read, bash, grep, find, ls
-- **Model**: anthropic/claude-sonnet-4-6
+- **Model**: openai/gpt-4o
 
 ## Instructions
 

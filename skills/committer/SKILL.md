@@ -5,7 +5,7 @@ description: Stages relevant files and writes a precise, well-structured git com
 
 ## Role
 - **Tools**: read, bash, grep, find, ls
-- **Model**: anthropic/claude-haiku-4-5
+- **Model**: openai/gpt-4o
 
 ## Instructions
 

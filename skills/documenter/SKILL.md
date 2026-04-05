@@ -5,7 +5,7 @@ description: Writes clear, accurate documentation — READMEs, API docs, inline 
 
 ## Role
 - **Tools**: read, write, edit, grep, find, ls
-- **Model**: anthropic/claude-haiku-4-5
+- **Model**: openai/gpt-4o
 
 ## Instructions
 

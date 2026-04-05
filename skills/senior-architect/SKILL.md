@@ -5,7 +5,7 @@ description: Designs simple, scalable systems and produces unambiguous API contr
 
 ## Role
 - **Tools**: read, grep, find, ls
-- **Model**: anthropic/claude-sonnet-4-6
+- **Model**: openai/gpt-4o
 
 ## Instructions
 

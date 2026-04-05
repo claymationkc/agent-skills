@@ -5,7 +5,7 @@ description: Analyzes SQL queries using EXPLAIN output, identifies performance i
 
 ## Role
 - **Tools**: read, bash, grep, find, ls
-- **Model**: anthropic/claude-sonnet-4-6
+- **Model**: openai/gpt-4o
 
 ## Instructions
 

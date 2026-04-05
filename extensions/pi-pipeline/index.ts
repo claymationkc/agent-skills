@@ -47,12 +47,31 @@ import { spawn } from "child_process";
 const SESSIONS_BASE = join(homedir(), ".pi-pipeline", "sessions");
 const SKILLS_DIR = join(homedir(), "pi-skills", "skills");
 
+/** Extract the **Model**: value from a skill's SKILL.md frontmatter body. */
+function readSkillModel(skillPath: string): string | undefined {
+  try {
+    const md = readFileSync(join(skillPath, "SKILL.md"), "utf-8");
+    const match = md.match(/^\s*-\s*\*\*Model\*\*:\s*(.+)$/m);
+    return match?.[1]?.trim() || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 /** Approximate char limits (1 token ≈ 4 chars) */
 const TOKEN_LIMITS = {
   taskJson: 4096 * 4,         // 4,096 tokens — task inputs
-  resultJson: 2048 * 4,       // 2,048 tokens — sub-agent outputs
-  architectResult: 8192 * 4,  // 8,192 tokens — architect output exception
+  resultJson: 2048 * 4,       // 2,048 tokens — default sub-agent output
 } as const;
+
+/** Per-agent output char limits. Agents that produce large structured artifacts get more room. */
+const AGENT_RESULT_LIMITS: Record<string, number> = {
+  "senior-architect": 16384 * 4,  // 16K tokens — API contracts, schemas, full designs
+  "coding":           4096 * 4,   // 4K tokens  — file lists, implementation summaries
+  "scouter":          4096 * 4,   // 4K tokens  — codebase maps
+  "reviewer":         4096 * 4,   // 4K tokens  — detailed review notes
+  "data-engineer":    4096 * 4,   // 4K tokens  — pipeline specs, model definitions
+};
 
 // ── Usage tracking ────────────────────────────────────────────────────────────
 
@@ -157,6 +176,89 @@ function outputPath(sessionDir: string, agent: string, run: number): string {
     : join(sessionDir, agent, `run-${run}`, "output", "result.json");
 }
 
+// ── Resource resolution ───────────────────────────────────────────────────────
+
+interface ResourceEntry {
+  description: string;
+  path: string;
+  for_skills: string[];
+  optional: boolean;
+}
+
+/** Load ~/.pi-pipeline/env as KEY=VALUE pairs into a plain object. */
+function loadEnvConfig(): Record<string, string> {
+  const envFile = join(homedir(), ".pi-pipeline", "env");
+  if (!existsSync(envFile)) return {};
+  const env: Record<string, string> = {};
+  for (const line of readFileSync(envFile, "utf-8").split("\n")) {
+    const m = line.match(/^([A-Z_][A-Z0-9_]*)=(.+)$/);
+    if (m) env[m[1]] = m[2].trim();
+  }
+  return env;
+}
+
+/** Load ~/pi-skills/resources.json. Returns {} if the file does not exist. */
+function loadResourceManifest(): Record<string, ResourceEntry> {
+  const manifestPath = join(homedir(), "pi-skills", "resources.json");
+  if (!existsSync(manifestPath)) return {};
+  try {
+    return JSON.parse(readFileSync(manifestPath, "utf-8")).resources ?? {};
+  } catch {
+    return {};
+  }
+}
+
+/**
+ * Expand ${VAR} in a path template using the provided env map.
+ * Returns null if any variable is unresolved or the result is empty.
+ */
+function resolvePathTemplate(template: string, env: Record<string, string>): string | null {
+  const resolved = template.replace(/\$\{([A-Z_][A-Z0-9_]*)\}/g, (_, key) => env[key] ?? "");
+  if (resolved.includes("${") || resolved === "") return null;
+  return resolved.startsWith("~/") ? join(homedir(), resolved.slice(2)) : resolved;
+}
+
+/**
+ * Return the resolved paths for resources declared for a given skill.
+ * Only returns paths that actually exist on disk.
+ */
+
+/**
+ * Extract tilde or absolute file/directory paths from a command argument string.
+ * Handles ~/... and /absolute/paths but ignores bare words.
+ */
+function extractPathsFromArgs(args: string): string[] {
+  const paths: string[] = [];
+  for (const token of args.split(/\s+/)) {
+    if (token.startsWith("~/") || token.startsWith("/")) {
+      const resolved = token.startsWith("~/")
+        ? join(homedir(), token.slice(2))
+        : token;
+      if (existsSync(resolved)) paths.push(resolved);
+    }
+  }
+  return paths;
+}
+
+/** Strip path tokens and --context flags from args so they don't pollute the goal text. */
+function stripPathsFromArgs(args: string): string {
+  return args
+    .split(/\s+/)
+    .filter((t) => !t.startsWith("~/") && !t.startsWith("/") && !t.startsWith("--context"))
+    .join(" ")
+    .trim();
+}
+
+/**
+ * Extract --context tag1,tag2 from args.
+ * Returns the list of resource tag names, or [] if the flag is absent.
+ */
+function extractContextTags(args: string): string[] {
+  const m = args.match(/--context\s+([^\s]+)/);
+  if (!m) return [];
+  return m[1].split(",").map((t) => t.trim()).filter(Boolean);
+}
+
 // ── Extension Factory ─────────────────────────────────────────────────────────
 
 export default async function (api: ExtensionAPI) {
@@ -179,6 +281,8 @@ async function registerOrchestrator(api: ExtensionAPI) {
   const sessionDir = join(SESSIONS_BASE, sessionId);
   const runCounts = new Map<string, number>();
   const usage = makeUsage("orchestrator", "orchestrator");
+  const envConfig = loadEnvConfig();
+  const resourceManifest = loadResourceManifest();
 
   // Create base session directories
   mkdirSync(join(sessionDir, "orchestrator", "input"), { recursive: true });
@@ -204,20 +308,23 @@ async function registerOrchestrator(api: ExtensionAPI) {
   api.registerCommand("pipeline", {
     description: "Start a pipeline task routed through the orchestrator",
     handler: async (args: string) => {
-      const task = args.trim();
-
-      if (!task) {
-        api.sendUserMessage("Usage: /pipeline <task description>");
+      if (!args.trim()) {
+        api.sendUserMessage("Usage: /pipeline <task description> [path/to/context ...]");
         return;
       }
+
+      const explicitRefs = extractPathsFromArgs(args);
+      const contextTags = extractContextTags(args);
+      const task = stripPathsFromArgs(args);
 
       // Write the task to orchestrator/input/task.json
       const taskPayload = {
         session_id: sessionId,
         agent: "orchestrator",
         goal: task,
-        task: "Decompose this goal into a pipeline. Plan the agents needed, write tasks for each, dispatch them in order, and terminate when the reviewer approves.",
-        context_refs: [],
+        task: "Decompose this goal into a pipeline. Plan the agents needed, write tasks for each, dispatch them in order, and terminate when the reviewer approves. Forward context_refs and resource_tags from this task to sub-agents that need domain context.",
+        context_refs: explicitRefs,
+        ...(contextTags.length > 0 && { resource_tags: contextTags }),
       };
 
       writeFileSync(
@@ -314,11 +421,34 @@ async function registerOrchestrator(api: ExtensionAPI) {
       mkdirSync(inputDir, { recursive: true });
       mkdirSync(join(sessionDir, params.agent, `run-${run}`, "output"), { recursive: true });
 
+      const incomingTask = params.task as Record<string, unknown>;
+
+      // Resolve resource_tags declared by the orchestrator into real paths.
+      // Auto-injection by skill name was removed — the orchestrator decides
+      // which resources are relevant for each specific task, not the extension.
+      const requestedTags: string[] = Array.isArray(incomingTask.resource_tags)
+        ? (incomingTask.resource_tags as string[])
+        : [];
+      const taggedRefs = requestedTags.flatMap((tag) => {
+        const entry = resourceManifest[tag];
+        if (!entry) return [];
+        const resolved = resolvePathTemplate(entry.path, envConfig);
+        return resolved && existsSync(resolved) ? [resolved] : [];
+      });
+
+      const explicitRefs: string[] = Array.isArray(incomingTask.context_refs)
+        ? (incomingTask.context_refs as string[])
+        : [];
+      const mergedRefs = [...new Set([...explicitRefs, ...taggedRefs])];
+
+      // eslint-disable-next-line @typescript-eslint/no-unused-vars
+      const { resource_tags: _dropped, ...taskBody } = incomingTask;
       const taskWithMeta = {
         session_id: sessionId,
         agent: params.agent,
         run,
-        ...(params.task as object),
+        ...taskBody,
+        context_refs: mergedRefs,
       };
 
       const raw = JSON.stringify(taskWithMeta, null, 2);
@@ -406,8 +536,11 @@ async function registerOrchestrator(api: ExtensionAPI) {
         PI_PIPELINE_RUN: String(run),
       };
 
+      const model = readSkillModel(skillPath);
+      const spawnArgs = ["--print", "--skill", skillPath, ...(model ? ["--model", model] : []), prompt];
+
       return new Promise((resolve) => {
-        const proc = spawn("pi", ["--print", "--skill", skillPath, prompt], {
+        const proc = spawn("pi", spawnArgs, {
           env,
           stdio: ["ignore", "pipe", "pipe"],
         });
@@ -620,18 +753,30 @@ async function registerSubAgent(api: ExtensionAPI) {
     }),
     execute: async (_id, params) => {
       const path = outputPath(sessionDir, agentName, run);
-      const limitChars = agentName === "senior-architect"
-        ? TOKEN_LIMITS.architectResult
-        : TOKEN_LIMITS.resultJson;
+      const limitChars = AGENT_RESULT_LIMITS[agentName] ?? TOKEN_LIMITS.resultJson;
+
+      const resultObj =
+        params.result !== null &&
+        typeof params.result === "object" &&
+        !Array.isArray(params.result)
+          ? (params.result as object)
+          : { output: params.result };
 
       const raw = JSON.stringify(
-        { session_id: sessionId, agent: agentName, run, ...(params.result as object) },
+        { session_id: sessionId, agent: agentName, run, ...resultObj },
         null,
         2,
       );
-      const bounded = enforceLimit(raw, limitChars, `${agentName}/output`);
+      if (raw.length > limitChars) {
+        return {
+          content: [{
+            type: "text",
+            text: `Error: output is ${raw.length} chars but limit is ${limitChars} (~${Math.round(limitChars / 4)} tokens). Summarize your result and call write_output again.`,
+          }],
+        };
+      }
 
-      writeFileSync(path, bounded, "utf-8");
+      writeFileSync(path, raw, "utf-8");
       writeUsageFile(sessionDir, `${agentName}-run-${run}.json`, usage);
 
       appendLog(sessionDir, {
@@ -640,10 +785,10 @@ async function registerSubAgent(api: ExtensionAPI) {
         agent: agentName,
         run,
         event: "write_output",
-        content: { path, chars: bounded.length },
+        content: { path, chars: raw.length },
       });
 
-      return { content: [{ type: "text", text: `Output written → ${path} (${bounded.length} chars)` }] };
+      return { content: [{ type: "text", text: `Output written → ${path} (${raw.length} chars)` }] };
     },
   });
 }

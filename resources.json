@@ -1,0 +1,17 @@
+{
+  "$comment": "Resource manifest — defines named context resources and which skills use them. Paths use ${VAR} templates resolved from ~/.pi-pipeline/env at runtime. Optional resources are silently skipped when the path does not exist or the env var is unset.",
+  "resources": {
+    "datalake-core-schema": {
+      "description": "Core datalake schema docs — entity definitions, grain, relationships, naming conventions",
+      "path": "${DATALAKE_DOCS}/core-schema",
+      "for_skills": ["data-engineer", "senior-architect", "scouter"],
+      "optional": true
+    },
+    "dbt-project": {
+      "description": "Root of the dbt project — models, sources, macros",
+      "path": "${DBT_PROJECT_DIR}",
+      "for_skills": ["data-engineer", "testing", "scouter"],
+      "optional": true
+    }
+  }
+}

@@ -5,7 +5,7 @@ description: Simplifies and cleans up existing code without changing behavior â€
 
 ## Role
 - **Tools**: read, write, edit, bash, grep, find, ls
-- **Model**: anthropic/claude-sonnet-4-6
+- **Model**: openai/gpt-4o
 
 ## Instructions
 
