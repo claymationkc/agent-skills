@@ -5,7 +5,7 @@ description: Decomposes complex tasks, dispatches to specialist agents via struc
 
 ## Role
 - **Tools**: read, bash
-- **Model**: openai/gpt-4o
+- **Model**: openai-codex/gpt-5.1-codex-mini
 
 ## Instructions
 

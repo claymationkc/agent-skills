@@ -5,7 +5,7 @@ description: Reads the codebase and produces a structured map of relevant files,
 
 ## Role
 - **Tools**: read, grep, find, ls
-- **Model**: openai/gpt-4o
+- **Model**: openai-codex/gpt-5.1-codex-mini
 - **Note**: Uses a smaller model — scouting is read-only and does not require heavy reasoning.
 
 ## Instructions

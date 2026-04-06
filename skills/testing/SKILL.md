@@ -5,7 +5,7 @@ description: Writes and executes tests, reports pass/fail results, and flags beh
 
 ## Role
 - **Tools**: read, write, edit, bash, grep, find, ls
-- **Model**: openai/gpt-4o
+- **Model**: openai-codex/gpt-5.1-codex-mini
 
 ## Instructions
 

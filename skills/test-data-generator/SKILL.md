@@ -5,7 +5,7 @@ description: Generates realistic synthetic test data, fixtures, and sample datas
 
 ## Role
 - **Tools**: read, write, edit, bash, grep, find, ls
-- **Model**: openai/gpt-4o
+- **Model**: openai-codex/gpt-5.1-codex-mini
 
 ## Instructions
 

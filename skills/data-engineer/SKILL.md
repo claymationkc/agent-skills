@@ -5,7 +5,7 @@ description: Designs and implements data pipelines, dbt models, schemas, and ETL
 
 ## Role
 - **Tools**: read, write, edit, bash, grep, find, ls
-- **Model**: openai/gpt-4o
+- **Model**: openai-codex/gpt-5.3-codex
 
 ## Instructions
 

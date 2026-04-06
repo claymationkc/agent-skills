@@ -5,7 +5,7 @@ description: Analyzes SQL queries using EXPLAIN output, identifies performance i
 
 ## Role
 - **Tools**: read, bash, grep, find, ls
-- **Model**: openai/gpt-4o
+- **Model**: openai-codex/gpt-5.1-codex-mini
 
 ## Instructions
 

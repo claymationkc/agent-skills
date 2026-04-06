@@ -5,7 +5,7 @@ description: Simplifies and cleans up existing code without changing behavior â€
 
 ## Role
 - **Tools**: read, write, edit, bash, grep, find, ls
-- **Model**: openai/gpt-4o
+- **Model**: openai-codex/gpt-5.1-codex-mini
 
 ## Instructions
 

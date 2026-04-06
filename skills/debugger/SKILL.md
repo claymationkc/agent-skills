@@ -5,7 +5,7 @@ description: Diagnoses bugs and errors by reading stack traces, logs, and code â
 
 ## Role
 - **Tools**: read, bash, grep, find, ls
-- **Model**: openai/gpt-4o
+- **Model**: openai-codex/gpt-5.1-codex-mini
 
 ## Instructions
 

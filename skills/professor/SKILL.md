@@ -5,7 +5,7 @@ description: Teaches one concept through a short interactive lesson with checkpo
 
 ## Role
 - **Tools**: read
-- **Model**: openai/gpt-4o
+- **Model**: openai-codex/gpt-5.1-codex-mini
 
 ## Instructions
 

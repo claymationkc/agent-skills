@@ -5,7 +5,7 @@ description: Designs simple, scalable systems and produces unambiguous API contr
 
 ## Role
 - **Tools**: read, grep, find, ls
-- **Model**: openai/gpt-4o
+- **Model**: openai-codex/gpt-5.3-codex
 
 ## Instructions
 

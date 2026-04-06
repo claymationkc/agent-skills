@@ -5,7 +5,7 @@ description: Teaches one computing concept in a focused 10-minute interactive le
 
 ## Role
 - **Tools**: read
-- **Model**: openai/gpt-4o
+- **Model**: openai-codex/gpt-5.1-codex-mini
 
 ## Instructions
 

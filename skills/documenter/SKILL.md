@@ -5,7 +5,7 @@ description: Writes clear, accurate documentation — READMEs, API docs, inline 
 
 ## Role
 - **Tools**: read, write, edit, grep, find, ls
-- **Model**: openai/gpt-4o
+- **Model**: openai-codex/gpt-5.1-codex-mini
 
 ## Instructions
 

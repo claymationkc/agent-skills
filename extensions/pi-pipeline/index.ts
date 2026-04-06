@@ -234,6 +234,9 @@ function extractPathsFromArgs(args: string): string[] {
       const resolved = token.startsWith("~/")
         ? join(homedir(), token.slice(2))
         : token;
+      // Reject filesystem root and other overly broad paths (depth < 2)
+      const depth = resolved.replace(/\/$/, "").split("/").filter(Boolean).length;
+      if (depth < 2) continue;
       if (existsSync(resolved)) paths.push(resolved);
     }
   }
